@@ -10,6 +10,10 @@
 # 1. use python:3.12.3-slim as the base image until https://github.com/pydantic/pydantic-core/issues/1292 gets resolved
 # 2. do not add --platform=$BUILDPLATFORM because the pydantic binaries must be resolved for the final architecture
 # Use a Python image with uv pre-installed
+# Toolchain versions shared by every stage below. Keeping the Node version here
+# means the build and runtime stages cannot silently resolve different Nodes.
+ARG NODE_VERSION=22.23.2
+
 FROM ghcr.io/astral-sh/uv:latest AS uv_installer
 FROM registry.access.redhat.com/ubi10/python-314-minimal AS builder
 USER root
@@ -111,21 +115,23 @@ RUN microdnf update -y \
 RUN python3.14 -m pip install --upgrade pip
 COPY --from=builder /usr/local/bin/uv /usr/local/bin/uv
 COPY --from=builder /usr/local/bin/uvx /usr/local/bin/uvx
+# NODE_VERSION and the npm major below are coupled: npm 12 requires Node
+# ^22.22.2 || ^24.15.0 || >=26.0.0. Pin the npm major rather than tracking
+# @latest, so the next npm major raising its engines floor cannot break this
+# layer unannounced against a pinned NODE_VERSION.
+ARG NODE_VERSION
 RUN ARCH=$(uname -m) \
     && if [ "$ARCH" = "x86_64" ]; then NODE_ARCH="x64"; \
        elif [ "$ARCH" = "aarch64" ]; then NODE_ARCH="arm64"; \
        else NODE_ARCH="$ARCH"; fi \
-    && NODE_VERSION=$(curl -fsSL https://nodejs.org/dist/latest-v22.x/ \
-                    | sed -nE "s/.*node-v([0-9]+\.[0-9]+\.[0-9]+)-linux-${NODE_ARCH}\.tar\.xz.*/\1/p" \
-                    | head -1) \
-    && if [ -z "$NODE_VERSION" ]; then echo "ERROR: Could not determine Node.js version" && exit 1; fi \
     && curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" \
     | tar -xJ -C /usr/local --strip-components=1 \
-    && npm install -g npm@latest
+    && npm install -g npm@12
 RUN useradd user -u 1000 -g 0 --no-create-home --home-dir /app/data
 
 COPY --from=builder --chown=1000 /app/.venv /app/.venv
 ENV PATH="/app/.venv/bin:$PATH"
+ENV HOME=/app/data
 ENV BASH_ENV="" \
     ENV="" \
     PROMPT_COMMAND=""
@@ -137,14 +143,15 @@ ENV BASH_ENV="" \
 # write secret_key, profile_pictures, etc. Without this, the volume is created
 # as root:root and Langflow crashes during startup with PermissionError on
 # /app/langflow/secret_key. See https://github.com/langflow-ai/langflow/issues/10437
-RUN mkdir -p /app/langflow && chown -R 1000:0 /app/langflow && chmod -R g+rwX /app/langflow
+RUN mkdir -p /app/data /app/langflow \
+    && chown -R 1000:0 /app/data /app/langflow \
+    && chmod -R g+rwX /app/data /app/langflow
 
 # Give the runtime user (uid 1000) a writable npm cache. The image ships Node so
-# users can spawn stdio MCP servers via `npx`, but on the ubi10 base
-# HOME=/opt/app-root/src is not owned by uid 1000, so npx otherwise fails with
-# `EACCES` on ~/.npm/_cacache and stdio MCP servers never list any tools. Pin
-# npm's cache to a uid-1000-owned dir (immune to the base image's HOME) and hand
-# ownership of the default HOME cache to the runtime user as a fallback.
+# users can spawn stdio MCP servers via `npx`. Pin npm's cache to a
+# uid-1000-owned dir so callers that override HOME cannot make the cache
+# read-only, and keep the UBI base image's default HOME cache writable as a
+# fallback.
 # See https://github.com/langflow-ai/langflow/pull/13893 (ubi10 base change).
 ENV NPM_CONFIG_CACHE=/app/.npm
 RUN mkdir -p /app/.npm /opt/app-root/src/.npm \

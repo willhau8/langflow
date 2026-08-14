@@ -83,6 +83,7 @@ from langflow.services.database.models.api_key.model import ApiKeyCreate
 from langflow.services.database.models.user.crud import get_user_by_username
 from langflow.services.database.models.user.model import User
 from langflow.services.deps import get_service
+from langflow.services.rate_limit.service import get_last_forwarded_for_hop
 
 # Constants
 ALL_INTERFACES_HOST = "0.0.0.0"  # noqa: S104
@@ -132,6 +133,17 @@ async def verify_project_auth(
                     return project_user
             raise HTTPException(status_code=404, detail="Project owner not found")
 
+    # ``none`` intentionally publishes this project's MCP surface without a
+    # credential. Keep that behavior, but never represent the anonymous caller
+    # as the instance-wide superuser: tool execution must stay within the
+    # published project's owning principal.
+    if project_auth_type == "none":
+        if project.user_id:
+            project_user = await db.get(User, project.user_id)
+            if project_user:
+                return project_user
+        raise HTTPException(status_code=404, detail="Project owner not found")
+
     # OAuth projects must present a valid API key at the Langflow transport endpoint: network-level
     # trust (loopback / same-host proxy) is unsafe because it cannot distinguish the local MCP
     # Composer subprocess from another loopback peer behind a reverse proxy or sidecar. The
@@ -175,6 +187,9 @@ async def verify_project_auth(
 
         return user
 
+    # Legacy AUTO_LOGIN projects without explicit auth settings retain the
+    # existing single-user fallback. Explicit public projects returned their
+    # owner above and can never reach this system-superuser path.
     return await _superuser_fallback(db, settings_service)
 
 
@@ -778,6 +793,9 @@ def get_client_ip(request: Request) -> str:
     (``rate_limit_trust_proxy``) do we consult ``X-Forwarded-For``, and then we
     take the rightmost entry — the last hop added by the trusted proxy, which a
     client cannot forge — mirroring ``langflow.services.rate_limit.service.get_client_ip``.
+    Every occurrence of the header is joined first, so a proxy that appends its
+    own line rather than extending the client's cannot leave the attacker's line
+    as the one we read.
 
     Args:
         request: FastAPI Request object
@@ -788,11 +806,9 @@ def get_client_ip(request: Request) -> str:
     # Only consult X-Forwarded-For when an operator has explicitly declared a
     # trusted proxy; otherwise the header is attacker-controlled.
     if get_settings_service().settings.rate_limit_trust_proxy:
-        forwarded_for = request.headers.get("X-Forwarded-For")
-        if forwarded_for:
-            # Rightmost entry = last hop added by the trusted proxy (unspoofable);
-            # the leftmost entry is client-supplied and must never be trusted.
-            return forwarded_for.split(",")[-1].strip()
+        last_hop = get_last_forwarded_for_hop(request)
+        if last_hop:
+            return last_hop
 
     # Default: trust only the real TCP peer.
     if request.client:
